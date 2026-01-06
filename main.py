@@ -17,7 +17,7 @@ import csv
 import sys
 sys.path.append('..')
 
-from model import Net, NetL
+from model import Net
 from utils.config import process_config, get_args
 from utils.lr import MultiStepLRWarmUp
 from data_preparation import MoleculeDataset
