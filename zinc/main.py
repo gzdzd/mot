@@ -11,6 +11,7 @@ import numpy as np
 from tqdm import tqdm
 ### importing OGB
 # from ogb.graphproppred import Evaluator, collate_dgl
+from dgl import function as fn
 
 import csv
 
@@ -26,7 +27,19 @@ from data_preparation import MoleculeDataset
 torch.set_num_threads(1)
 
 
-def train(model, device, loader, optimizer):
+def diffusion_teacher(graph, node_embed, bases, config):
+    with graph.local_scope():
+        graph.ndata['h'] = node_embed
+        graph.edata['w'] = bases.sum(dim=1)
+        graph.update_all(fn.u_mul_e('h', 'w', 'm'), fn.sum('m', 't'))
+        teacher = graph.ndata['t']
+        if config.get('distill_norm', 'deg') == 'deg':
+            deg = graph.in_degrees().clamp(min=1).to(teacher.dtype).unsqueeze(-1)
+            teacher = teacher / deg
+        return teacher
+
+
+def train(model, device, loader, optimizer, distill_config):
     model.train()
     loss_all = 0
 
@@ -38,10 +51,17 @@ def train(model, device, loader, optimizer):
         labels = labels.to(device)
 
         # (#0515)
-        pred = model(bg, x, edge_attr, bases)
+        if distill_config.get('enable', 'N') == 'Y':
+            pred, node_repr = model(bg, x, edge_attr, bases, return_node=True)
+        else:
+            pred = model(bg, x, edge_attr, bases)
         optimizer.zero_grad()
 
         loss = F.l1_loss(pred, labels)
+        if distill_config.get('enable', 'N') == 'Y':
+            teacher = diffusion_teacher(bg, model.atom_encoder(x), bases, distill_config)
+            distill_loss = F.mse_loss(node_repr, teacher)
+            loss = loss + distill_config.get('weight', 0.0) * distill_loss
         loss.backward()
         optimizer.step()
         loss_all = loss_all + loss.detach().item()
@@ -261,7 +281,7 @@ def run_with_given_seed(config, ts_fk_algo_hp):
     for epoch in range(cur_epoch + 1, config.hyperparams.epochs + 1):
         lr = scheduler.optimizer.param_groups[0]['lr']
         # print("Epoch {} training...".format(epoch))
-        train_loss = train(model, device, train_loader, optimizer)
+        train_loss = train(model, device, train_loader, optimizer, config.hyperparams.get('distill', {}))
         scheduler.step()
 
         # print('Evaluating...')

@@ -52,7 +52,7 @@ class Net(torch.nn.Module):
                 nn.GELU(),
             )
 
-    def forward(self, g, x, edge_attr, bases):
+    def forward(self, g, x, edge_attr, bases, return_node=False):
         x = self.atom_encoder(x)
         # edge_attr = self.bond_encoder(edge_attr).sum(dim=1)
         edge_attr = self.bond_encoder(edge_attr)
@@ -61,7 +61,10 @@ class Net(torch.nn.Module):
         for conv in self.convs:
             x = conv(g, x, edge_attr, bases)
         h_graph = self.pool(g, x)
-        return self.graph_pred_linear(h_graph)
+        pred = self.graph_pred_linear(h_graph)
+        if return_node:
+            return pred, x
+        return pred
 
     def __repr__(self):
         return self.__class__.__name__
@@ -125,7 +128,7 @@ class NetL(torch.nn.Module):
         elif config.pooling == 'X':
             self.pool = MaxPooling()
 
-    def forward(self, g, x, edge_attr, bases):
+    def forward(self, g, x, edge_attr, bases, return_node=False):
         x = self.atom_encoder(x)
         # edge_attr = self.bond_encoder(edge_attr).sum(dim=1)
         edge_attr = self.bond_encoder(edge_attr)
@@ -133,7 +136,10 @@ class NetL(torch.nn.Module):
         for conv in self.convs:
             x = conv(g, x, edge_attr, bases)
         h_graph = self.pool(g, x)
-        return self.graph_pred_linear(h_graph)
+        pred = self.graph_pred_linear(h_graph)
+        if return_node:
+            return pred, x
+        return pred
 
     def __repr__(self):
         return self.__class__.__name__
