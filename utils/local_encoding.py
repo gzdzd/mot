@@ -107,6 +107,31 @@ def power_eigen(adj, config):
     return bases
 
 
+def motif_matrices(adj):
+    adj_bin = (adj > 0).to(dtype=adj.dtype)
+    two_hop = torch.matmul(adj_bin, adj_bin)
+    two_hop = two_hop - torch.diag_embed(torch.diagonal(two_hop))
+    triangle = two_hop * adj_bin
+    return {
+        'path2': two_hop,
+        'triangle': triangle,
+    }
+
+
+def motif_diffusion(adj, config):
+    motifs = motif_matrices(adj)
+    motif_power = config.get('motif_power', [1])
+    motif_coeff = config.get('motif_coeff', 1.0)
+    bases = []
+    for motif_name in config.motif:
+        if motif_name not in motifs:
+            raise ValueError('Unsupported motif: {}'.format(motif_name))
+        motif_adj = motifs[motif_name] * motif_coeff
+        for power_spec in motif_power:
+            bases = bases + power(power_spec, motif_adj)
+    return bases
+
+
 def pair_augment(g, bases, config):
     if len(g.ndata['feat'].shape) == 1:
         nfeat = g.ndata['feat'].unsqueeze(-1)
@@ -136,6 +161,9 @@ def build_local_encoding(g, config):
 
     if config.get('norm2') is not None:
         bases = bases + power_norm2(adj, config)
+
+    if config.get('motif') is not None:
+        bases = bases + motif_diffusion(adj, config)
 
     bases = torch.cat(bases, dim=-1)
 

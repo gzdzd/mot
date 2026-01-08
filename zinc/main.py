@@ -11,6 +11,7 @@ import numpy as np
 from tqdm import tqdm
 ### importing OGB
 # from ogb.graphproppred import Evaluator, collate_dgl
+from dgl import function as fn
 
 import csv
 
@@ -26,7 +27,37 @@ from data_preparation import MoleculeDataset
 torch.set_num_threads(1)
 
 
-def train(model, device, loader, optimizer):
+def diffusion_teacher(graph, node_embed, bases, config):
+    mode = config.get('distill_mode', 'sum')
+    steps = int(config.get('distill_steps', 1))
+    residual = float(config.get('distill_residual', 0.0))
+    with graph.local_scope():
+        graph.ndata['h'] = node_embed
+        if mode == 'mean':
+            graph.edata['w'] = bases.mean(dim=1)
+        else:
+            graph.edata['w'] = bases.sum(dim=1)
+        h0 = node_embed
+        for _ in range(max(steps, 1)):
+            graph.update_all(fn.u_mul_e('h', 'w', 'm'), fn.sum('m', 't'))
+            teacher = graph.ndata['t']
+            if config.get('distill_norm', 'deg') == 'deg':
+                deg = graph.in_degrees().clamp(min=1).to(teacher.dtype).unsqueeze(-1)
+                teacher = teacher / deg
+            graph.ndata['h'] = residual * h0 + (1.0 - residual) * teacher
+        return graph.ndata['h']
+
+
+def semi_supervised_masks(labels, config):
+    if config.get('enable', 'N') != 'Y':
+        return torch.ones(labels.shape[0], dtype=torch.bool, device=labels.device)
+    ratio = float(config.get('unlabeled_ratio', 0.0))
+    if ratio <= 0:
+        return torch.ones(labels.shape[0], dtype=torch.bool, device=labels.device)
+    return torch.rand(labels.shape[0], device=labels.device) >= ratio
+
+
+def train(model, device, loader, optimizer, distill_config, semi_config):
     model.train()
     loss_all = 0
 
@@ -38,10 +69,31 @@ def train(model, device, loader, optimizer):
         labels = labels.to(device)
 
         # (#0515)
-        pred = model(bg, x, edge_attr, bases)
+        if distill_config.get('enable', 'N') == 'Y' or semi_config.get('enable', 'N') == 'Y':
+            pred, node_repr = model(bg, x, edge_attr, bases, return_node=True)
+        else:
+            pred = model(bg, x, edge_attr, bases)
         optimizer.zero_grad()
 
-        loss = F.l1_loss(pred, labels)
+        labeled_mask = semi_supervised_masks(labels, semi_config)
+        if labeled_mask.any():
+            loss = F.l1_loss(pred[labeled_mask], labels[labeled_mask])
+        else:
+            loss = torch.tensor(0.0, device=labels.device)
+
+        teacher_node = None
+        if distill_config.get('enable', 'N') == 'Y':
+            teacher_node = diffusion_teacher(bg, model.atom_encoder(x), bases, distill_config)
+            distill_loss = F.mse_loss(node_repr, teacher_node)
+            loss = loss + distill_config.get('weight', 0.0) * distill_loss
+        if semi_config.get('enable', 'N') == 'Y' and (~labeled_mask).any():
+            if teacher_node is None:
+                teacher_node = diffusion_teacher(bg, model.atom_encoder(x), bases, semi_config)
+            teacher_graph = model.pool(bg, teacher_node)
+            teacher_pred = model.graph_pred_linear(teacher_graph).detach()
+            unlabeled_mask = ~labeled_mask
+            ssl_loss = F.l1_loss(pred[unlabeled_mask], teacher_pred[unlabeled_mask])
+            loss = loss + semi_config.get('weight', 0.0) * ssl_loss
         loss.backward()
         optimizer.step()
         loss_all = loss_all + loss.detach().item()
@@ -261,7 +313,9 @@ def run_with_given_seed(config, ts_fk_algo_hp):
     for epoch in range(cur_epoch + 1, config.hyperparams.epochs + 1):
         lr = scheduler.optimizer.param_groups[0]['lr']
         # print("Epoch {} training...".format(epoch))
-        train_loss = train(model, device, train_loader, optimizer)
+        train_loss = train(model, device, train_loader, optimizer,
+                           config.hyperparams.get('distill', {}),
+                           config.hyperparams.get('semi_supervised', {}))
         scheduler.step()
 
         # print('Evaluating...')
